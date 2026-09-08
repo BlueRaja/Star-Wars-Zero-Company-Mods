@@ -1,8 +1,8 @@
 -- Speedy Stimulants
 -- Speeds stim/medpack throw + self-use presentations.
 
-local ANIM_SPEED_MULTIPLIER = 1.5
-local PROJECTILE_SPEED_MULTIPLIER = 2.5
+local Settings = require("MXM")
+
 local DELAY_TIME = 0.01 -- latent Delay misbehaves at exactly 0
 local PRESENTATION_MAX_MS = 6000
 
@@ -10,8 +10,19 @@ local TAG = "[SpeedyStimulants]"
 local presentation_active = false
 local presentation_generation = 0
 
+-- Baseline projectile props so mid-game multiplier changes do not stack.
+local projectile_baselines = {}
+
 local function log(fmt, ...)
     print(string.format(TAG .. " " .. fmt .. "\n", ...))
+end
+
+local function get_anim_mult()
+    return tonumber(Settings.Get("anim_speed_multiplier"))
+end
+
+local function get_thrown_item_mult()
+    return tonumber(Settings.Get("thrown_item_speed_multiplier"))
 end
 
 local function full_name(obj)
@@ -114,7 +125,14 @@ local function begin_presentation()
     presentation_active = true
     presentation_generation = presentation_generation + 1
     local gen = presentation_generation
-    log("Speeding stimulant presentation (anim=%sx projectile=%sx)", tostring(ANIM_SPEED_MULTIPLIER), tostring(PROJECTILE_SPEED_MULTIPLIER))
+    local anim_mult = get_anim_mult()
+    local thrown_mult = get_thrown_item_mult()
+    log(
+        "Speeding stimulant presentation (anim=%sx thrown=%sx window=%sms)",
+        tostring(anim_mult),
+        tostring(thrown_mult),
+        tostring(PRESENTATION_MAX_MS)
+    )
     ExecuteWithDelay(PRESENTATION_MAX_MS, function()
         if gen == presentation_generation then
             presentation_active = false
@@ -170,11 +188,12 @@ local function patch_anim_rate(obj)
     if not (is_stim_anim(name) or is_throw_stance(name)) then
         return
     end
+    local anim_mult = get_anim_mult()
     local old = get_prop(obj, "RateScale")
-    if old == ANIM_SPEED_MULTIPLIER then
+    if old == anim_mult then
         return
     end
-    set_prop(obj, "RateScale", ANIM_SPEED_MULTIPLIER)
+    set_prop(obj, "RateScale", anim_mult)
 end
 
 NotifyOnNewObject("/Script/Engine.AnimSequence", patch_anim_rate)
@@ -187,29 +206,42 @@ local function patch_projectile(obj)
     if not obj or not obj:IsValid() or is_default(obj) then
         return
     end
-    local old = get_prop(obj, "FlightSpeedModifier") or 1.0
-    if old >= PROJECTILE_SPEED_MULTIPLIER then
-        return
+
+    local name = full_name(obj)
+    local baseline = projectile_baselines[name]
+    if not baseline then
+        baseline = {
+            flight = get_prop(obj, "FlightSpeedModifier") or 1.0,
+            fx = get_prop(obj, "FX_TimeToTargetEvent_Time"),
+        }
+        projectile_baselines[name] = baseline
     end
-    set_prop(obj, "FlightSpeedModifier", old * PROJECTILE_SPEED_MULTIPLIER)
-    local fx = get_prop(obj, "FX_TimeToTargetEvent_Time")
-    if fx and fx > 0 then
-        set_prop(obj, "FX_TimeToTargetEvent_Time", fx / PROJECTILE_SPEED_MULTIPLIER)
+
+    local mult = get_thrown_item_mult()
+    local desired_flight = baseline.flight * mult
+    local current_flight = get_prop(obj, "FlightSpeedModifier") or 1.0
+    if current_flight ~= desired_flight then
+        set_prop(obj, "FlightSpeedModifier", desired_flight)
+    end
+
+    if baseline.fx and baseline.fx > 0 then
+        local desired_fx = baseline.fx / mult
+        local current_fx = get_prop(obj, "FX_TimeToTargetEvent_Time")
+        if current_fx ~= desired_fx then
+            set_prop(obj, "FX_TimeToTargetEvent_Time", desired_fx)
+        end
     end
 end
 
-NotifyOnNewObject(
+local PROJECTILE_CLASSES = {
     "/Game/Game/GameData/WeaponInfo/Projectiles/BP_Projectile_CombatStim.BP_Projectile_CombatStim_C",
-    patch_projectile
-)
-NotifyOnNewObject(
     "/Game/Game/GameData/WeaponInfo/Projectiles/BP_Projectile_MedKit.BP_Projectile_MedKit_C",
-    patch_projectile
-)
-NotifyOnNewObject(
     "/Game/Game/GameData/WeaponInfo/Projectiles/BP_Projectile_MedKit_SurgeonTool.BP_Projectile_MedKit_SurgeonTool_C",
-    patch_projectile
-)
+}
+
+for _, class_path in ipairs(PROJECTILE_CLASSES) do
+    NotifyOnNewObject(class_path, patch_projectile)
+end
 
 --------------------------------------------------------------------------
 -- Montage play-rate (stance wait + stim/throw montages)
@@ -228,7 +260,8 @@ do
                 return
             end
 
-            set_param(InPlayRate, ANIM_SPEED_MULTIPLIER)
+            local anim_mult = get_anim_mult()
+            set_param(InPlayRate, anim_mult)
             local anim = unwrap(Context)
             ExecuteWithDelay(0, function()
                 if not anim or not montage then
@@ -236,7 +269,7 @@ do
                 end
                 pcall(function()
                     if anim.Montage_SetPlayRate then
-                        anim:Montage_SetPlayRate(montage, ANIM_SPEED_MULTIPLIER)
+                        anim:Montage_SetPlayRate(montage, anim_mult)
                     end
                 end)
             end)
@@ -248,14 +281,68 @@ do
 end
 
 --------------------------------------------------------------------------
+-- Live re-apply when MXM settings change
+--------------------------------------------------------------------------
+local function reapply_settings(reason)
+    local anim_mult = get_anim_mult()
+    local thrown_mult = get_thrown_item_mult()
+    log(
+        "Re-applying settings (%s): anim=%sx thrown=%sx window=%sms",
+        tostring(reason),
+        tostring(anim_mult),
+        tostring(thrown_mult),
+        tostring(PRESENTATION_MAX_MS)
+    )
+
+    local anim_count = 0
+    foreach_of("AnimSequence", function(obj)
+        local name = full_name(obj)
+        if is_stim_anim(name) or is_throw_stance(name) then
+            patch_anim_rate(obj)
+            anim_count = anim_count + 1
+        end
+    end)
+    foreach_of("AnimMontage", function(obj)
+        local name = full_name(obj)
+        if is_stim_anim(name) or is_throw_stance(name) then
+            patch_anim_rate(obj)
+            anim_count = anim_count + 1
+        end
+    end)
+
+    local proj_count = 0
+    for _, class_path in ipairs(PROJECTILE_CLASSES) do
+        local short = class_path:match("([^%.]+)$") or class_path
+        foreach_of(short, function(obj)
+            patch_projectile(obj)
+            proj_count = proj_count + 1
+        end)
+    end
+
+    log("Re-apply done: patched %d anim asset(s), %d projectile(s)", anim_count, proj_count)
+end
+
+Settings.OnChange(function(values, changed)
+    log(
+        "settings changed: %s (anim=%s thrown=%s)",
+        table.concat(changed, ", "),
+        tostring(values.anim_speed_multiplier),
+        tostring(values.thrown_item_speed_multiplier)
+    )
+    reapply_settings("OnChange")
+end)
+
+--------------------------------------------------------------------------
 -- Startup (patch assets already loaded)
 --------------------------------------------------------------------------
 foreach_of("AnimSequence", patch_anim_rate)
 foreach_of("AnimMontage", patch_anim_rate)
 
 log(
-    "Mod Loaded. ANIM=%sx PROJECTILE=%sx DELAY_TIME=%s",
-    tostring(ANIM_SPEED_MULTIPLIER),
-    tostring(PROJECTILE_SPEED_MULTIPLIER),
+    "Mod Loaded. MXM available=%s ANIM=%sx THROWN=%sx WINDOW=%sms DELAY_TIME=%s",
+    tostring(Settings.IsAvailable()),
+    tostring(get_anim_mult()),
+    tostring(get_thrown_item_mult()),
+    tostring(PRESENTATION_MAX_MS),
     tostring(DELAY_TIME)
 )
